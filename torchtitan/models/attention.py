@@ -19,7 +19,10 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
-from torch.nn.attention.varlen import varlen_attn
+try:
+    from torch.nn.attention.varlen import varlen_attn
+except ImportError:
+    varlen_attn = None
 from torch.types import Number
 
 
@@ -49,9 +52,20 @@ class VarlenMetadata(NamedTuple):
 
 
 class VarlenAttentionWrapper(torch.nn.Module):
-    _compiled_varlen_attn: ClassVar[Callable] = torch.compile(
-        varlen_attn, mode="max-autotune-no-cudagraphs"
-    )
+    _compiled_varlen_attn: ClassVar[Callable | None] = None
+
+    @classmethod
+    def _get_compiled_varlen_attn(cls) -> Callable:
+        if cls._compiled_varlen_attn is None:
+            if varlen_attn is None:
+                raise ImportError(
+                    "torch.nn.attention.varlen is not available in this version of PyTorch. "
+                    "VarlenAttentionWrapper requires PyTorch >= 2.10."
+                )
+            cls._compiled_varlen_attn = torch.compile(
+                varlen_attn, mode="max-autotune-no-cudagraphs"
+            )
+        return cls._compiled_varlen_attn
 
     def forward(
         self,
@@ -74,7 +88,7 @@ class VarlenAttentionWrapper(torch.nn.Module):
         # pyrefly: ignore [no-matching-overload]
         xv_packed = xv.transpose(1, 2).reshape(-1, n_local_heads, head_dim)
 
-        return VarlenAttentionWrapper._compiled_varlen_attn(
+        return VarlenAttentionWrapper._get_compiled_varlen_attn()(
             xq_packed,
             xk_packed,
             xv_packed,

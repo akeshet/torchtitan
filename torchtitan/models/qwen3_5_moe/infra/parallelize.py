@@ -32,7 +32,7 @@ from torch.distributed.tensor.parallel import (
 )
 
 import torchtitan.models.qwen3_5_moe.model.model as _qwen3_model
-from torchtitan.config import CompileConfig, JobConfig, TORCH_DTYPE_MAP
+from torchtitan.config import JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import NoParallel, ParallelDims
 from torchtitan.distributed.activation_checkpoint import apply_ac
 from torchtitan.models.llama3.infra.parallelize import apply_ddp

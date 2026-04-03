@@ -4,27 +4,24 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
-
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.nn.attention.flex_attention import BlockMask
+from torch.nn.attention.flex_attention import and_masks, BlockMask
 
-from torchtitan.models.common.attention import (
-    AttentionMasksType,
-    BaseAttention,
-    create_varlen_metadata_for_document,
+from torchtitan.components.tokenizer import BaseTokenizer
+from torchtitan.models.attention import (
+    create_attention_mask,
     FlexAttentionWrapper,
+    get_causal_mask_mod,
+    get_document_mask_mod,
     ScaledDotProductAttentionWrapper,
-    VarlenAttentionWrapper,
-    VarlenMetadata,
 )
-from torchtitan.models.common.feed_forward import FeedForward
-from torchtitan.models.common.moe.moe import MoE
-from torchtitan.models.common.rope import apply_rotary_emb_cos_sin, RoPE
-from torchtitan.protocols import Module
-from torchtitan.protocols.model import BaseModel
+from torchtitan.models.moe import FeedForward, MoE
+from torchtitan.protocols.model import AttentionMasksType
+from torchtitan.protocols.train_spec import ModelProtocol
+
+from .args import AttentionConfig, GatedDeltaNetConfig, Qwen35MoEModelArgs
 
 try:
     from fla.ops.gated_delta_rule import (
@@ -84,6 +81,102 @@ class RMSNormGated(nn.Module):
 
     def reset_parameters(self):
         nn.init.ones_(self.weight)
+
+
+# ---------------------------------------------------------------------------
+# RoPE — adapted from qwen3/model/model.py with partial RoPE support
+# ---------------------------------------------------------------------------
+
+
+def precompute_freqs_cis(
+    dim: int, max_seq_len: int, base: float = 1_000_000.0
+) -> torch.Tensor:
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(max_seq_len, dtype=freqs.dtype, device=freqs.device)
+    idx_theta = torch.outer(t, freqs).float()
+    freqs = torch.cat([idx_theta, idx_theta], dim=-1)
+    freqs_cis = torch.cat([freqs.cos(), freqs.sin()], dim=-1)
+    return freqs_cis
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def reshape_for_broadcast(
+    freqs_cis: torch.Tensor, x: torch.Tensor, positions: torch.Tensor | None = None
+) -> torch.Tensor:
+    ndim = x.ndim
+    assert ndim > 1
+    bz, seqlen, _, head_dim = x.shape
+    if positions is None:
+        freqs_cis = freqs_cis[0:seqlen]
+        assert freqs_cis.shape == (seqlen, head_dim * 2)
+        shape = [-1, seqlen, 1, head_dim * 2]
+        return freqs_cis.view(*shape)
+    elif positions.size(0) == 1:
+        assert positions.shape == (1, seqlen)
+        freqs_cis = freqs_cis[positions.squeeze(0)]
+        assert freqs_cis.shape == (seqlen, head_dim * 2)
+        shape = [-1, seqlen, 1, head_dim * 2]
+        return freqs_cis.view(*shape)
+    else:
+        assert positions.shape == (bz, seqlen)
+        freqs_cis_expanded = freqs_cis[None, :, None, :].expand(bz, -1, -1, -1)
+        freqs_cis = torch.gather(
+            freqs_cis_expanded,
+            dim=1,
+            index=positions.view(bz, seqlen, 1, 1).expand(bz, seqlen, 1, head_dim * 2),
+        )
+        assert freqs_cis.shape == (bz, seqlen, 1, head_dim * 2)
+        return freqs_cis
+
+
+def apply_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    head_dim = xq.shape[-1]
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq, positions)
+    cos = freqs_cis[..., :head_dim].to(dtype=xq.dtype, device=xq.device)
+    sin = freqs_cis[..., head_dim:].to(dtype=xq.dtype, device=xq.device)
+    xq_out = (xq * cos) + (rotate_half(xq) * sin)
+    xk_out = (xk * cos) + (rotate_half(xk) * sin)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+def apply_partial_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    rotary_dim: int,
+    positions: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply RoPE only to the first ``rotary_dim`` elements of Q and K."""
+    if rotary_dim >= xq.shape[-1]:
+        return apply_rotary_emb(xq, xk, freqs_cis, positions)
+    xq_rot, xq_pass = xq[..., :rotary_dim], xq[..., rotary_dim:]
+    xk_rot, xk_pass = xk[..., :rotary_dim], xk[..., rotary_dim:]
+    xq_rot, xk_rot = apply_rotary_emb(xq_rot, xk_rot, freqs_cis, positions)
+    xq = torch.cat([xq_rot, xq_pass], dim=-1)
+    xk = torch.cat([xk_rot, xk_pass], dim=-1)
+    return xq, xk
+
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    bs, slen, n_kv_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        torch.unsqueeze(x, dim=3)
+        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
+        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -216,24 +309,14 @@ def _gated_delta_rule_dispatch(
 # ---------------------------------------------------------------------------
 
 
-class GatedDeltaNet(Module):
+class GatedDeltaNet(nn.Module):
     """Gated DeltaNet linear attention.
 
     Completely different from standard attention: no RoPE, no attention masks,
     different head structure. Uses recurrent state + gated delta rule.
     """
 
-    @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        n_key_heads: int
-        n_value_heads: int
-        key_head_dim: int
-        value_head_dim: int
-        conv_kernel_size: int = 4
-        norm_eps: float = 1e-6
-        fla_backend: str = "fla_chunked"
-
-    def __init__(self, config: Config, *, dim: int, **kwargs):
+    def __init__(self, config: GatedDeltaNetConfig, *, dim: int):
         super().__init__()
         self.n_key_heads = config.n_key_heads
         self.n_value_heads = config.n_value_heads
@@ -315,7 +398,7 @@ class GatedDeltaNet(Module):
         output = output.reshape(B, L, -1)
         return self.out_proj(output)
 
-    def init_weights(self, init_std: float = 0.02, **kwargs) -> None:
+    def init_weights(self, init_std: float):
         for linear in (
             self.in_proj_qkv,
             self.in_proj_z,
@@ -338,7 +421,7 @@ class GatedDeltaNet(Module):
 # ---------------------------------------------------------------------------
 
 
-class Attention(BaseAttention):
+class Attention(nn.Module):
     """Full attention with output gating and partial RoPE for Qwen3.5 MoE.
 
     Key differences from GQAttention:
@@ -348,20 +431,7 @@ class Attention(BaseAttention):
     - QK norm uses ``OffsetRMSNorm``
     """
 
-    @dataclass(kw_only=True, slots=True)
-    class Config(BaseAttention.Config):
-        n_heads: int
-        n_kv_heads: int | None = None
-        head_dim: int | None = None
-        rotary_dim: int | None = None
-        qk_norm: bool = True
-        norm_eps: float = 1e-6
-        bias: bool = False
-        attn_backend: str = "sdpa"
-        attn_mask_type: str = "causal"
-        rope_backend: str = "cos_sin"
-
-    def __init__(self, config: Config, *, dim: int, **kwargs):
+    def __init__(self, config: AttentionConfig, *, dim: int):
         super().__init__()
         self.n_heads = config.n_heads
         self.n_kv_heads = (
@@ -371,7 +441,8 @@ class Attention(BaseAttention):
             config.head_dim if config.head_dim is not None else dim // config.n_heads
         )
         self.rotary_dim = config.rotary_dim
-        self.enable_gqa = self.n_heads > self.n_kv_heads
+        self.n_rep = self.n_heads // self.n_kv_heads
+        self.use_flex_attn = config.attn_backend == "flex"
 
         # QK norm uses OffsetRMSNorm (not nn.RMSNorm)
         self.q_norm: OffsetRMSNorm | None = None
@@ -389,17 +460,26 @@ class Attention(BaseAttention):
         self.wv = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=config.bias)
         self.wo = nn.Linear(self.n_heads * self.head_dim, dim, bias=config.bias)
 
-        self.attn_backend = config.attn_backend
-        self.inner_attention: nn.Module
-        match self.attn_backend:
-            case "flex":
-                self.inner_attention = FlexAttentionWrapper()
-            case "varlen":
-                self.inner_attention = VarlenAttentionWrapper()
-            case "sdpa":
-                self.inner_attention = ScaledDotProductAttentionWrapper()
-            case _:
-                raise ValueError(f"Unknown attention type: {self.attn_backend}")
+        if self.use_flex_attn:
+            self.inner_attention = FlexAttentionWrapper()
+        else:
+            self.inner_attention = ScaledDotProductAttentionWrapper()
+
+    def init_weights(self, init_std: float):
+        nn.init.trunc_normal_(self.wq.weight, mean=0.0, std=0.02)
+        if self.wq.bias is not None:
+            nn.init.trunc_normal_(self.wq.bias, mean=0.0, std=0.02)
+        for linear in (self.wk, self.wv):
+            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
+            if linear.bias is not None:
+                nn.init.trunc_normal_(linear.bias, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
+        if self.wo.bias is not None:
+            nn.init.trunc_normal_(self.wo.bias, mean=0.0, std=init_std)
+        if self.q_norm is not None:
+            self.q_norm.reset_parameters()
+        if self.k_norm is not None:
+            self.k_norm.reset_parameters()
 
     def forward(
         self,
@@ -422,86 +502,34 @@ class Attention(BaseAttention):
         if self.k_norm is not None:
             xk = self.k_norm(xk)
 
-        # Partial RoPE: only first rotary_dim elements get RoPE
-        if self.rotary_dim is not None and self.rotary_dim < self.head_dim:
-            xq_rot, xq_pass = xq[..., : self.rotary_dim], xq[..., self.rotary_dim :]
-            xk_rot, xk_pass = xk[..., : self.rotary_dim], xk[..., self.rotary_dim :]
-            xq_rot, xk_rot = apply_rotary_emb_cos_sin(
-                xq_rot, xk_rot, rope_cache, positions
-            )
-            xq = torch.cat([xq_rot, xq_pass], dim=-1)
-            xk = torch.cat([xk_rot, xk_pass], dim=-1)
-        else:
-            xq, xk = apply_rotary_emb_cos_sin(xq, xk, rope_cache, positions)
+        # Partial RoPE
+        xq, xk = apply_partial_rotary_emb(
+            xq, xk, rope_cache, self.rotary_dim, positions
+        )
+
+        # Repeat k/v heads for GQA
+        keys = repeat_kv(xk, self.n_rep)
+        values = repeat_kv(xv, self.n_rep)
 
         xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
-        xk = xk.transpose(1, 2)
-        xv = xv.transpose(1, 2)
+        xk = keys.transpose(1, 2)
+        xv = values.transpose(1, 2)
 
-        scale_kwargs = {"scale": self.scaling} if self.scaling is not None else {}
+        if self.use_flex_attn:
+            assert isinstance(attention_masks, BlockMask), attention_masks
+            output = self.inner_attention(
+                xq, xk, xv, block_mask=attention_masks, scale=self.scaling
+            )
+        else:
+            assert attention_masks is None
+            output = self.inner_attention(xq, xk, xv, scale=self.scaling)
 
-        match self.attn_backend:
-            case "flex":
-                if isinstance(attention_masks, dict):
-                    block_mask = attention_masks["rope"]
-                else:
-                    assert isinstance(attention_masks, BlockMask), attention_masks
-                    block_mask = attention_masks
-                output = (
-                    self.inner_attention(
-                        xq,
-                        xk,
-                        xv,
-                        block_mask=block_mask,
-                        enable_gqa=self.enable_gqa,
-                        **scale_kwargs,
-                    )
-                    .transpose(1, 2)
-                    .contiguous()
-                )  # (bs, seqlen, n_heads, head_dim)
-            case "varlen":
-                assert isinstance(attention_masks, VarlenMetadata), attention_masks
-                output = self.inner_attention(
-                    xq, xk, xv, attention_masks, **scale_kwargs
-                )
-                # VarlenAttention returns (bs * seqlen, n_heads, head_dim)
-                output = output.view(bs, seqlen, -1, self.head_dim)
-            case "sdpa":
-                assert attention_masks is None
-                output = (
-                    self.inner_attention(
-                        xq,
-                        xk,
-                        xv,
-                        enable_gqa=self.enable_gqa,
-                        **scale_kwargs,
-                    )
-                    .transpose(1, 2)
-                    .contiguous()
-                )  # (bs, seqlen, n_heads, head_dim)
-            case _:
-                raise ValueError(f"Unknown attention type: {self.attn_backend}")
+        output = output.transpose(1, 2).contiguous()  # (bs, seqlen, n_heads, head_dim)
 
         # Output gating: attn_output * sigmoid(gate) before wo
         output = output * torch.sigmoid(gate)
         output = output.view(bs, seqlen, -1)
         return self.wo(output)
-
-    def init_weights(self, init_std: float = 0.02, **kwargs) -> None:
-        nn.init.trunc_normal_(self.wq.weight, mean=0.0, std=0.02)
-        if self.wq.bias is not None:
-            nn.init.trunc_normal_(self.wq.bias, mean=0.0, std=0.02)
-        for linear in (self.wk, self.wv):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-            if linear.bias is not None:
-                nn.init.trunc_normal_(linear.bias, mean=0.0, std=0.02)
-        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
-        if self.wo.bias is not None:
-            nn.init.trunc_normal_(self.wo.bias, mean=0.0, std=init_std)
-        if self.q_norm is not None:
-            self.q_norm.reset_parameters()
-        if self.k_norm is not None:
-            self.k_norm.reset_parameters()
 
 
 # ---------------------------------------------------------------------------
@@ -509,35 +537,29 @@ class Attention(BaseAttention):
 # ---------------------------------------------------------------------------
 
 
-class TransformerBlock(Module):
+class TransformerBlock(nn.Module):
     """Transformer block for Qwen3.5 MoE hybrid decoder.
 
     Each layer uses either full attention (``Attention``) or linear attention
-    (``GatedDeltaNet``), determined at build time by ``layer_type``. Both types
+    (``GatedDeltaNet``), determined by ``full_attention_interval``. Both types
     share the same MoE + gated shared expert FFN structure.
     """
 
-    @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        norm_eps: float = 1e-6
-        attention: Attention.Config
-        deltanet: GatedDeltaNet.Config
-        moe: MoE.Config
-        feed_forward: FeedForward.Config  # shared expert
-
-    def __init__(
-        self, config: Config, *, dim: int, layer_type: str, layer_id: int, n_layers: int
-    ):
+    def __init__(self, layer_id: int, model_args: Qwen35MoEModelArgs):
         super().__init__()
-        self.layer_type = layer_type
+        dim = model_args.dim
+        layer_config = model_args.layer
         self.layer_id = layer_id
-        self.n_layers = n_layers
+
+        # Determine layer type
+        is_full_attn = (layer_id + 1) % model_args.full_attention_interval == 0
+        self.layer_type = "full_attention" if is_full_attn else "linear_attention"
 
         # Attention: full or DeltaNet
-        if layer_type == "full_attention":
-            self.attn = config.attention.build(dim=dim)
+        if self.layer_type == "full_attention":
+            self.attn = Attention(layer_config.attention, dim=dim)
         else:
-            self.attn = config.deltanet.build(dim=dim)
+            self.attn = GatedDeltaNet(layer_config.deltanet, dim=dim)
 
         # MoE (routed experts only, num_shared_experts=0)
         # NOTE: Weight layout difference vs transformers —
@@ -545,19 +567,27 @@ class TransformerBlock(Module):
         # tensor of shape (num_experts, 2*intermediate_size, hidden_size),
         # while we keep them as separate w1 (gate) and w3 (up) in GroupedExperts.
         # Checkpoint conversion must split gate_up_proj along dim=1 into w1/w3.
-        self.moe = config.moe.build(dim=dim)
+        self.moe_enabled = True  # always True for Qwen3.5 MoE
+        self.moe = MoE(
+            layer_config.moe.to_moe_args(),
+            dim=dim,
+            hidden_dim=layer_config.moe.hidden_dim,
+        )
 
         # Shared expert: FeedForward + sigmoid gate
-        self.shared_ffn = config.feed_forward.build(dim=dim)
+        self.shared_ffn = FeedForward(
+            dim=dim, hidden_dim=layer_config.feed_forward.hidden_dim
+        )
         self.shared_gate = nn.Linear(dim, 1, bias=False)
 
         # Norms (OffsetRMSNorm)
-        self.attention_norm = OffsetRMSNorm(dim, eps=config.norm_eps)
-        self.ffn_norm = OffsetRMSNorm(dim, eps=config.norm_eps)
+        self.attention_norm = OffsetRMSNorm(dim, eps=layer_config.norm_eps)
+        self.ffn_norm = OffsetRMSNorm(dim, eps=layer_config.norm_eps)
 
-    @property
-    def moe_enabled(self) -> bool:
-        return hasattr(self, "moe") and self.moe is not None
+        if model_args.depth_init:
+            self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
+        else:
+            self.weight_init_std = 0.02 / (2 * model_args.n_layers) ** 0.5
 
     def forward(
         self,
@@ -581,16 +611,10 @@ class TransformerBlock(Module):
         x = x + moe_out + shared_out
         return x
 
-    def init_weights(self, **kwargs) -> None:
-        buffer_device = kwargs.get("buffer_device")
-        weight_init_std = 0.02 / (2 * (self.layer_id + 1)) ** 0.5
-
-        self.attn.init_weights(init_std=weight_init_std)
-        self.moe.init_weights(
-            init_std=weight_init_std,
-            buffer_device=buffer_device or torch.device("cpu"),
-        )
-        self.shared_ffn.init_weights(init_std=weight_init_std)
+    def init_weights(self, buffer_device: torch.device):
+        self.attn.init_weights(self.weight_init_std)
+        self.moe.init_weights(self.weight_init_std, buffer_device)
+        self.shared_ffn.init_weights(self.weight_init_std)
         nn.init.trunc_normal_(self.shared_gate.weight, mean=0.0, std=0.02)
         self.attention_norm.reset_parameters()
         self.ffn_norm.reset_parameters()
@@ -601,7 +625,7 @@ class TransformerBlock(Module):
 # ---------------------------------------------------------------------------
 
 
-class Model(BaseModel):
+class Qwen35MoEModel(nn.Module, ModelProtocol):
     """Qwen3.5 MoE hybrid decoder model.
 
     Alternates between GatedDeltaNet (linear attention) and full attention
@@ -609,106 +633,79 @@ class Model(BaseModel):
     full attention; the rest use GatedDeltaNet.
     """
 
-    @dataclass(kw_only=True, slots=True)
-    class Config(BaseModel.Config):
-        dim: int
-        n_layers: int
-        vocab_size: int
-        norm_eps: float = 1e-6
-        rope: RoPE.Config
-        layer: TransformerBlock.Config
-        full_attention_interval: int = 4
-
-        def update_from_config(
-            self,
-            *,
-            trainer_config,
-            **kwargs,
-        ) -> None:
-            import dataclasses as _dc
-            import logging
-
-            logger = logging.getLogger(__name__)
-
-            training = trainer_config.training
-            parallelism = trainer_config.parallelism
-            debug = trainer_config.debug
-            seq_len = training.seq_len
-            if seq_len > self.rope.max_seq_len:
-                logger.warning(
-                    f"Sequence length {seq_len} exceeds original maximum {self.rope.max_seq_len}."
-                )
-            # Sync rope max_seq_len
-            self.rope = _dc.replace(self.rope, max_seq_len=seq_len)
-
-            if self.layer.moe is not None:
-                self.layer.moe._debug_force_load_balance = debug.moe_force_load_balance
-
-        def get_nparams_and_flops(
-            self, model: nn.Module, seq_len: int
-        ) -> tuple[int, int]:
-            from torchtitan.models.utils import get_moe_model_nparams_and_flops
-
-            assert isinstance(self.layer.attention, Attention.Config)
-            assert self.layer.attention.head_dim is not None
-            return get_moe_model_nparams_and_flops(
-                self,
-                model,
-                self.layer.attention.n_heads,
-                2 * self.layer.attention.head_dim,
-                seq_len,
-            )
-
-    def __init__(self, config: Config):
+    def __init__(self, model_args: Qwen35MoEModelArgs):
         super().__init__()
-        self.config = config
+        self.model_args = model_args
+        self.vocab_size = model_args.vocab_size
+        self.n_layers = model_args.n_layers
 
-        self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
+        self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
 
-        self.rope = config.rope.build()
-        self.register_buffer("freqs_cis", self.rope.cache, persistent=False)
+        self.register_buffer(
+            "freqs_cis", self._precompute_freqs_cis(), persistent=False
+        )
 
         self.layers = torch.nn.ModuleDict()
-        for layer_id in range(config.n_layers):
-            is_full = (layer_id + 1) % config.full_attention_interval == 0
-            layer_type = "full_attention" if is_full else "linear_attention"
-            self.layers[str(layer_id)] = config.layer.build(
-                dim=config.dim,
-                layer_type=layer_type,
-                layer_id=layer_id,
-                n_layers=config.n_layers,
+        for layer_id in range(model_args.n_layers):
+            self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
+
+        self.norm = OffsetRMSNorm(model_args.dim, eps=model_args.norm_eps)
+        self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
+
+    def _precompute_freqs_cis(self) -> torch.Tensor:
+        return precompute_freqs_cis(
+            self.model_args.rope.dim,
+            self.model_args.rope.max_seq_len,
+            self.model_args.rope.theta,
+        )
+
+    def init_weights(
+        self,
+        buffer_device: torch.device | None = None,
+    ):
+        buffer_device = buffer_device or self.freqs_cis.device
+        with torch.device(buffer_device):
+            self.freqs_cis = self._precompute_freqs_cis()
+        if self.tok_embeddings is not None:
+            nn.init.normal_(self.tok_embeddings.weight)
+        for layer in self.layers.values():
+            if layer is not None:
+                layer.init_weights(buffer_device)
+        if self.norm is not None:
+            self.norm.reset_parameters()
+        final_out_std = self.model_args.dim**-0.5
+        cutoff_factor = 3
+        if self.output is not None:
+            nn.init.trunc_normal_(
+                self.output.weight,
+                mean=0.0,
+                std=final_out_std,
+                a=-cutoff_factor * final_out_std,
+                b=cutoff_factor * final_out_std,
             )
-
-        self.norm = OffsetRMSNorm(config.dim, eps=config.norm_eps)
-        self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
-
-    @property
-    def attn_config(self):
-        """Convenience accessor for the attention config from layer."""
-        return self.config.layer.attention
 
     def get_attention_masks(
         self,
         input_batch: torch.Tensor,
-        tokenizer,
+        tokenizer: BaseTokenizer,
         extra_inputs: dict[str, torch.Tensor] | None = None,
     ) -> AttentionMasksType:
-        match self.attn_config.attn_backend:
-            case "varlen":
-                if self.attn_config.attn_mask_type != "block_causal":
-                    raise ValueError(
-                        f"varlen attention is only supported with block_causal "
-                        f"attention mask type, got {self.attn_config.attn_mask_type}"
-                    )
-                assert tokenizer.eos_id is not None
-                return create_varlen_metadata_for_document(
-                    input_batch, tokenizer.eos_id
+        mask_mods = [get_causal_mask_mod()]
+        match self.model_args.layer.attention.attn_mask_type:
+            case "causal":
+                B = 1
+            case "block_causal":
+                B = input_batch.shape[0]
+                mask_mods.append(
+                    get_document_mask_mod(input_batch, tokenizer.eos_id)
                 )
             case _:
-                raise TypeError(
-                    f"get_attention_masks not supported for "
-                    f"attn_backend='{self.attn_config.attn_backend}'"
+                raise ValueError(
+                    f"Unknown attention mask type: {self.model_args.layer.attention.attn_mask_type}"
                 )
+        return create_attention_mask(
+            and_masks(*mask_mods), B, None, input_batch.shape[1], input_batch.shape[1]
+        )
 
     def forward(
         self,
@@ -724,34 +721,3 @@ class Model(BaseModel):
         h = self.norm(h) if self.norm is not None else h
         output = self.output(h) if self.output is not None else h
         return output
-
-    def init_weights(self, **kwargs) -> None:
-        buffer_device: torch.device | None = kwargs.get("buffer_device")
-        buffer_device = buffer_device or self.freqs_cis.device
-
-        if self.rope is not None:
-            self.rope.init_weights(buffer_device=buffer_device)
-            self.freqs_cis = self.rope.cache
-        else:
-            # PP case: rope module was pruned, rebuild to get freqs_cis
-            rope = self.config.rope.build()
-            rope.init_weights(buffer_device=buffer_device)
-            self.freqs_cis = rope.cache
-
-        if self.tok_embeddings is not None:
-            nn.init.normal_(self.tok_embeddings.weight)
-        for layer in self.layers.values():
-            # pyrefly: ignore [not-callable]
-            layer.init_weights(buffer_device=buffer_device)
-        if self.norm is not None:
-            self.norm.reset_parameters()
-        final_out_std = self.config.dim**-0.5
-        cutoff_factor = 3
-        if self.output is not None:
-            nn.init.trunc_normal_(
-                self.output.weight,
-                mean=0.0,
-                std=final_out_std,
-                a=-cutoff_factor * final_out_std,
-                b=cutoff_factor * final_out_std,
-            )

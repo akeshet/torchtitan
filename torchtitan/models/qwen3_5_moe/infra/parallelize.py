@@ -18,7 +18,6 @@ residual stream throughout (SequenceParallel).
 """
 
 import torch
-import torch._inductor.config
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
@@ -32,27 +31,16 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
 )
 
-import torchtitan.models.qwen3_5_moe.model as _qwen3_model
-from torchtitan.config import (
-    ActivationCheckpointConfig,
-    CompileConfig,
-    ParallelismConfig,
-    TORCH_DTYPE_MAP,
-    TrainingConfig,
-)
-from torchtitan.distributed import ParallelDims
+import torchtitan.models.qwen3_5_moe.model.model as _qwen3_model
+from torchtitan.config import JobConfig, TORCH_DTYPE_MAP
+from torchtitan.distributed import NoParallel, ParallelDims
 from torchtitan.distributed.activation_checkpoint import apply_ac
-from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
-from torchtitan.distributed.dual_pipe_v import get_dual_pipe_v_flag
-from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp, NoParallel
-from torchtitan.models.llama3.parallelize import apply_replicate
-from torchtitan.models.llama4.parallelize import (
+from torchtitan.models.llama3.infra.parallelize import apply_ddp
+from torchtitan.models.llama4.infra.parallelize import (
     apply_compile,
     apply_fsdp,
     apply_moe_ep_tp,
 )
-from torchtitan.models.qwen3_5_moe.model import Model
-from torchtitan.protocols.model_converter import ModelConvertersContainer
 from torchtitan.tools.logging import logger
 
 
@@ -61,19 +49,14 @@ _op_sac_save_list = {
     torch.ops.aten.mm.default,
     torch.ops.aten._scaled_dot_product_efficient_attention.default,
     torch.ops.aten._scaled_dot_product_flash_attention.default,
-    torch.ops.aten._scaled_dot_product_cudnn_attention.default,
-    torch.ops.aten._scaled_dot_product_attention_math.default,
-    torch.ops.aten._scaled_dot_product_fused_attention_overrideable.default,
     torch.ops._c10d_functional.reduce_scatter_tensor.default,
     torch.ops.aten.max.default,
     torch._higher_order_ops.flex_attention,
-    torch.ops.torch_attn._varlen_attn.default,
-    torch._higher_order_ops.inductor_compiled_code,
 }
 
 
 # ---------------------------------------------------------------------------
-# CP + TP helper — inner_attention needs plain tensors for CP dispatcher
+# DTensor-safe wrappers
 # ---------------------------------------------------------------------------
 
 
@@ -235,17 +218,23 @@ def _install_dtensor_safe_dispatch() -> None:
     _qwen3_model._gated_delta_rule_dispatch = _dtensor_safe_dispatch
 
 
-def parallelize_qwen3_5_moe(
-    model: Model,
-    *,
+# ---------------------------------------------------------------------------
+# Main parallelization function
+# ---------------------------------------------------------------------------
+
+
+def parallelize_qwen35_moe(
+    model: nn.Module,
     parallel_dims: ParallelDims,
-    training: TrainingConfig,
-    model_converters: ModelConvertersContainer.Config,
-    parallelism: ParallelismConfig,
-    compile_config: CompileConfig,
-    ac_config: ActivationCheckpointConfig,
-    dump_folder: str,
+    job_config: JobConfig,
 ):
+    world_mesh = parallel_dims.world_mesh
+    training = job_config.training
+    parallelism = job_config.parallelism
+    compile_config = job_config.compile
+    ac_config = job_config.activation_checkpoint
+    dump_folder = job_config.job.dump_folder
+
     assert (
         training.seq_len % parallel_dims.seq_len_divisor == 0
     ), f"""
@@ -257,97 +246,76 @@ def parallelize_qwen3_5_moe(
         compile_config.enable and "model" in compile_config.components
     )
 
-    attn_backend = model.config.layer.attention.attn_backend
+    attn_backend = model.model_args.layer.attention.attn_backend
     if parallelism.context_parallel_degree > 1 and attn_backend not in (
         "sdpa",
-        "varlen",
     ):
         raise NotImplementedError(
-            f"Context Parallel only supports SDPA and varlen attention for Qwen3.5 MoE. "
+            f"Context Parallel only supports SDPA attention for Qwen3.5 MoE on v0.2.0. "
             f"Got attn_backend='{attn_backend}'."
         )
 
-    tp_mesh = None
     if parallel_dims.tp_enabled:
         if parallelism.enable_async_tensor_parallel and not model_compile_enabled:
             raise RuntimeError("Async TP requires torch.compile")
 
-        tp_mesh = parallel_dims.get_mesh("tp")
+        enable_float8_linear = "float8" in job_config.model.converters
+        float8_is_rowwise = job_config.quantize.linear.float8.recipe_name in (
+            "rowwise",
+            "rowwise_with_gw_hp",
+        )
+        enable_float8_tensorwise_tp = enable_float8_linear and not float8_is_rowwise
+
         apply_non_moe_tp(
             model,
-            tp_mesh,
+            world_mesh["tp"],
             loss_parallel=not parallelism.disable_loss_parallel,
-            cp_enabled=parallel_dims.cp_enabled,
+            enable_float8_tensorwise_tp=enable_float8_tensorwise_tp,
+            enable_async_tp=parallelism.enable_async_tensor_parallel,
         )
-        maybe_enable_async_tp(parallelism, compile_config, tp_mesh)
 
     if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
-        dual_pipe_v = get_dual_pipe_v_flag(
-            parallelism=parallelism, ac_config=ac_config, parallel_dims=parallel_dims
-        )
-
         apply_moe_ep_tp(
             model,
-            tp_mesh=parallel_dims.get_optional_mesh("tp"),
-            ep_mesh=parallel_dims.get_optional_mesh("ep"),
-            etp_mesh=parallel_dims.get_optional_mesh("etp"),
-            ep_etp_mesh=parallel_dims.get_optional_mesh(["ep", "etp"]),
-            dual_pipe_v=dual_pipe_v,
-        )
-
-    # Wrap inner_attention with DTensor-safe wrapper when needed.
-    # varlen_attn doesn't support DTensor inputs (unlike SDPA which has
-    # native DTensor dispatch), so we need this wrapper when TP is enabled.
-    # CP also needs it for both SDPA and varlen backends.
-    needs_dtensor_wrapper = (
-        parallel_dims.tp_enabled and attn_backend == "varlen"
-    ) or parallel_dims.cp_enabled
-    if needs_dtensor_wrapper:
-        # pyrefly: ignore [missing-attribute, not-callable]
-        for block in model.layers.values():
-            if block.layer_type == "full_attention":
-                wrapper = _DTensorSafeInnerAttention(block.attn.inner_attention)
-                block.attn.inner_attention = wrapper
-
-    if parallel_dims.cp_enabled:
-        # Apply CP to the actual attention module inside each wrapper
-        apply_cp_to_attention_module(
-            # pyrefly: ignore [missing-attribute, not-callable]
-            [
-                block.attn.inner_attention.inner
-                for block in model.layers.values()
-                if block.layer_type == "full_attention"
-            ],
-            parallel_dims.get_mesh("cp"),
-            attn_backend,
+            tp_mesh=world_mesh["tp"] if parallel_dims.tp_enabled else None,
+            ep_mesh=world_mesh["ep"] if parallel_dims.ep_enabled else None,
+            ep_tp_mesh=(
+                world_mesh["ep", "tp"]
+                if parallel_dims.tp_enabled
+                and parallel_dims.ep_enabled
+                and parallel_dims.etp_enabled
+                else None
+            ),
+            etp_enabled=parallel_dims.etp_enabled,
         )
 
     if ac_config.mode != "none":
+        use_flex_attn = attn_backend == "flex"
         apply_ac(
             model,
             ac_config,
             model_compile_enabled=model_compile_enabled,
-            # pyrefly: ignore [bad-argument-type]
+            use_flex_attn=use_flex_attn,
             op_sac_save_list=_op_sac_save_list,
             base_folder=dump_folder,
         )
 
     # turn on per-TransformerBlock compile after AC wrapping and before FSDP
     if model_compile_enabled:
-        apply_compile(model, compile_config, parallel_dims.ep_enabled)
+        apply_compile(model, compile_config)
 
-    if parallel_dims.fsdp_enabled or parallel_dims.ep_enabled:
-        dp_mesh_names = (
-            ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-        )
-        dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
+    if parallel_dims.fsdp_enabled:
+        if parallel_dims.dp_replicate_enabled:
+            dp_mesh_dim_names = ("dp_replicate", "dp_shard_cp")
+        else:
+            dp_mesh_dim_names = ("dp_shard_cp",)
+        dp_mesh = world_mesh[tuple(dp_mesh_dim_names)]
 
-        edp_mesh_names = (
-            ["dp_replicate", "efsdp"]
-            if parallel_dims.dp_replicate_enabled
-            else ["efsdp"]
-        )
-        edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
+        dp_mod_ep_mesh_dim_names = []
+        if parallel_dims.ep_enabled:
+            if parallel_dims.dp_replicate_enabled:
+                dp_mod_ep_mesh_dim_names.append("dp_replicate")
+            dp_mod_ep_mesh_dim_names.append("dp_shard_mod_ep")
 
         apply_fsdp(
             model,
@@ -358,7 +326,11 @@ def parallelize_qwen3_5_moe(
             cpu_offload=training.enable_cpu_offload,
             reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
             ep_degree=parallel_dims.ep,
-            edp_mesh=edp_mesh,
+            dp_mod_ep_mesh=(
+                world_mesh[tuple(dp_mod_ep_mesh_dim_names)]
+                if parallel_dims.ep_enabled
+                else None
+            ),
             gradient_divide_factor=parallel_dims.fsdp_gradient_divide_factor,
         )
 
@@ -367,24 +339,35 @@ def parallelize_qwen3_5_moe(
         else:
             logger.info("Applied FSDP to the model")
 
+        if parallel_dims.cp_enabled:
+            logger.info("Applied Context Parallel to the model")
+
         if training.enable_cpu_offload:
             logger.info("Applied CPU Offloading to the model")
     elif parallel_dims.dp_replicate_enabled:
-        apply_replicate(
+        if world_mesh.ndim > 1:
+            raise RuntimeError("DDP has not supported > 1D parallelism")
+        apply_ddp(
             model,
-            parallel_dims.get_mesh("dp_replicate"),
-            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            world_mesh,
+            enable_compile=model_compile_enabled,
+            enable_compiled_autograd=parallelism.enable_compiled_autograd,
         )
 
     return model
+
+
+# ---------------------------------------------------------------------------
+# Non-MoE tensor parallelism
+# ---------------------------------------------------------------------------
 
 
 def apply_non_moe_tp(
     model: nn.Module,
     tp_mesh: DeviceMesh,
     loss_parallel: bool,
-    cp_enabled: bool = False,
+    enable_float8_tensorwise_tp: bool,
+    enable_async_tp: bool,
 ):
     """Apply tensor parallelism to non-MoE components.
 
@@ -398,6 +381,27 @@ def apply_non_moe_tp(
     _install_dtensor_safe_dispatch()
     # Register softplus as a DTensor pointwise op (not in PyTorch's default table).
     _register_dtensor_softplus()
+
+    # Parallel styles for float8 vs standard
+    if enable_float8_tensorwise_tp:
+        from torchao.float8.float8_tensor_parallel import (
+            Float8ColwiseParallel,
+            Float8RowwiseParallel,
+            PrepareFloat8ModuleInput,
+        )
+
+        rowwise_parallel, colwise_parallel, prepare_module_input = (
+            Float8RowwiseParallel,
+            Float8ColwiseParallel,
+            PrepareFloat8ModuleInput,
+        )
+    else:
+        rowwise_parallel, colwise_parallel, prepare_module_input = (
+            RowwiseParallel,
+            ColwiseParallel,
+            PrepareModuleInput,
+        )
+
     # Global: embedding, final norm, output head
     parallelize_module(
         model,
@@ -417,7 +421,6 @@ def apply_non_moe_tp(
     )
 
     # Per-layer plans
-    positions_sharding = Replicate() if cp_enabled else None
     # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
         layer_plan = {
@@ -430,21 +433,16 @@ def apply_non_moe_tp(
             # Full attention: standard TP on Q/K/V/O projections
             layer_plan.update(
                 {
-                    "attn": PrepareModuleInput(
-                        input_layouts=(Shard(1), Replicate(), None, positions_sharding),
-                        desired_input_layouts=(
-                            Replicate(),
-                            Replicate(),
-                            None,
-                            positions_sharding,
-                        ),
+                    "attn": prepare_module_input(
+                        input_layouts=(Shard(1), Replicate(), None, None),
+                        desired_input_layouts=(Replicate(), Replicate(), None, None),
                     ),
-                    "attn.wq": ColwiseParallel(use_local_output=False),
-                    "attn.wk": ColwiseParallel(use_local_output=False),
-                    "attn.wv": ColwiseParallel(use_local_output=False),
+                    "attn.wq": colwise_parallel(use_local_output=False),
+                    "attn.wk": colwise_parallel(use_local_output=False),
+                    "attn.wv": colwise_parallel(use_local_output=False),
                     "attn.q_norm": SequenceParallel(sequence_dim=2),
                     "attn.k_norm": SequenceParallel(sequence_dim=2),
-                    "attn.wo": RowwiseParallel(output_layouts=Shard(1)),
+                    "attn.wo": rowwise_parallel(output_layouts=Shard(1)),
                 }
             )
         else:
@@ -499,13 +497,13 @@ def apply_non_moe_tp(
                     output_layout=Shard(1),
                     use_local_output=True,
                 ),
-                "shared_ffn": PrepareModuleInput(
+                "shared_ffn": prepare_module_input(
                     input_layouts=(Shard(1),),
                     desired_input_layouts=(Replicate(),),
                 ),
-                "shared_ffn.w1": ColwiseParallel(),
-                "shared_ffn.w2": RowwiseParallel(output_layouts=Shard(1)),
-                "shared_ffn.w3": ColwiseParallel(),
+                "shared_ffn.w1": colwise_parallel(),
+                "shared_ffn.w2": rowwise_parallel(output_layouts=Shard(1)),
+                "shared_ffn.w3": colwise_parallel(),
             }
         )
 
@@ -537,4 +535,13 @@ def apply_non_moe_tp(
                 requires_grad=attn.dt_bias.requires_grad,
             )
 
-    logger.info("Applied Tensor Parallelism to the model")
+    if enable_async_tp:
+        from torch.distributed._symmetric_memory import enable_symm_mem_for_group
+
+        torch._inductor.config._micro_pipeline_tp = True
+        enable_symm_mem_for_group(tp_mesh.get_group().group_name)
+
+    logger.info(
+        f"Applied {'Float8 tensorwise ' if enable_float8_tensorwise_tp else ''}{'Async ' if enable_async_tp else ''}"
+        "Tensor Parallelism to the model"
+    )

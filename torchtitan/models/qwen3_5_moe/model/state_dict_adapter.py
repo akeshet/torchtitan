@@ -18,14 +18,14 @@ import torch
 
 from torchtitan.protocols.state_dict_adapter import StateDictAdapter
 
-from .model import Model
+from .args import Qwen35MoEModelArgs
 
 # Prefix on all text-model keys in the HF checkpoint
 _HF_PREFIX = "model.language_model."
 
 
 class Qwen35MoEStateDictAdapter(StateDictAdapter):
-    def __init__(self, model_config: Model.Config, hf_assets_path: str | None):
+    def __init__(self, model_config: Qwen35MoEModelArgs, hf_assets_path: str | None):
         super().__init__(model_config, hf_assets_path)
         self.model_config = model_config
 
